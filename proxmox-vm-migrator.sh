@@ -1,5 +1,5 @@
 #!/bin/bash
-# prepare_vm_migration.sh
+# proxmox-vm-migrator.sh
 # Copyright 2025 Jason Houk
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,22 +14,63 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+VERSION="1.1.0"
+GITHUB_REPO="dubsector/proxmox-vm-migrator"
+SCRIPT_NAME="proxmox-vm-migrator.sh"
+
 # ------------ CONFIGURATION ------------
-CONFIG_FILE="$HOME/.proxmox_migration.conf"
+CONFIG_FILE="$HOME/.proxmox_vm_migrator.conf"
 DUMP_PATH="/var/lib/vz/dump"
 REMOTE_DUMP_PATH="/var/lib/vz/dump"
 SSH_USER="root"
 CLEANUP=false  # Set to true to delete local backup files after transfer
-LOGFILE="$HOME/proxmox_migration_$(date +%F_%H-%M-%S).log"
+LOGFILE="$HOME/proxmox_vm_migration_$(date +%F_%H-%M-%S).log"
 SHUTDOWN_TIMEOUT=60  # seconds
 # ---------------------------------------
 
 # ------------ LOGGING SETUP ------------
 exec > >(tee -a "$LOGFILE") 2>&1
 
+# ------------ CHECK FOR UPDATES --------
+check_for_update() {
+    echo "🔍 Checking for updates..."
+
+    LATEST_VERSION=$(curl -s "https://api.github.com/repos/$GITHUB_REPO/releases/latest" | grep '"tag_name":' | cut -d'"' -f4)
+    if [ -z "$LATEST_VERSION" ]; then
+        echo "⚠️  Could not retrieve latest version from GitHub."
+        return
+    fi
+
+    LATEST_VERSION_CLEAN="${LATEST_VERSION#v}"
+
+    if [[ "$LATEST_VERSION_CLEAN" != "$VERSION" ]]; then
+        echo "🚀 New version available: $LATEST_VERSION_CLEAN (current: $VERSION)"
+        read -p "🔄 Do you want to update and restart now? [y/N]: " DO_UPDATE
+        if [[ "$DO_UPDATE" =~ ^[Yy]$ ]]; then
+            TMP_SCRIPT="/tmp/$SCRIPT_NAME"
+            echo "⬇️  Downloading latest version from GitHub..."
+            curl -s -L "https://raw.githubusercontent.com/$GITHUB_REPO/main/$SCRIPT_NAME" -o "$TMP_SCRIPT"
+            if [ -s "$TMP_SCRIPT" ]; then
+                chmod +x "$TMP_SCRIPT"
+                mv "$TMP_SCRIPT" "$0"
+                echo "✅ Updated to version $LATEST_VERSION_CLEAN"
+                echo "🔁 Restarting script..."
+                exec "$0" "$@"
+            else
+                echo "❌ Failed to download the updated script."
+                exit 1
+            fi
+        else
+            echo "⏭️  Update skipped by user."
+        fi
+    else
+        echo "✅ You are running the latest version ($VERSION)."
+    fi
+}
+check_for_update "$@"
+
 # ------------ TOOL CHECKS --------------
 echo "🔍 Performing pre-flight checks..."
-
 for cmd in vzdump rsync ssh qm; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "❌ Required tool '$cmd' is not installed. Aborting."
