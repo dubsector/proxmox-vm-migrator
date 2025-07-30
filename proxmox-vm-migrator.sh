@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-VERSION="1.1.1"
+VERSION="1.1.2"
 GITHUB_REPO="dubsector/proxmox-vm-migrator"
 SCRIPT_NAME="proxmox-vm-migrator.sh"
 
@@ -33,6 +33,12 @@ MIN_FREE_GB=20       # Minimum GB required to proceed
 # ------------ LOGGING SETUP ------------
 exec > >(tee -a "$LOGFILE") 2>&1
 
+# ------------ SSH TRUST PREFLIGHT ------------
+ensure_ssh_trust() {
+  local host="$1"
+  # Accept the host key if it's new; no prompt in non-interactive use.
+  ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$SSH_USER@$host" "true" 2>/dev/null
+}
 # ------------ CHECK FOR UPDATES --------
 check_for_update() {
     echo "🔍 Checking for updates..."
@@ -174,26 +180,26 @@ free_gb_local() {
 # ------------ STORAGE HELPERS (REMOTE) --
 cfg_get_dir_path_remote() {
   local host="$1" store="$2"
-  ssh -o BatchMode=yes "$SSH_USER@$host" \
+  ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$SSH_USER@$host" \
     "awk -v s='$store' 'BEGIN{RS=\"\";FS=\"\\n\"} \$0 ~ \"^dir: \" s \"([[:space:]]|$)\" { for(i=1;i<=NF;i++) if (\$i ~ /^[[:space:]]*path[[:space:]]+/){ split(\$i,a,/[^[:space:]]+[[:space:]]+/); print a[2]; exit } }' /etc/pve/storage.cfg"
 }
 
 cfg_storage_has_backup_remote() {
   local host="$1" store="$2"
-  ssh -o BatchMode=yes "$SSH_USER@$host" \
+  ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$SSH_USER@$host" \
     "awk -v s='$store' 'BEGIN{RS=\"\";FS=\"\\n\"} \$0 ~ \"^dir: \" s \"([[:space:]]|$)\" { for(i=1;i<=NF;i++) if (\$i ~ /^[[:space:]]*content[[:space:]]+/ && \$i ~ /backup/){ print \"yes\"; exit } }' /etc/pve/storage.cfg"
 }
 
 list_dir_backup_storages_remote() {
   local host="$1"
   local ids
-  ids=$(ssh -o BatchMode=yes "$SSH_USER@$host" \
+  ids=$(ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$SSH_USER@$host" \
     "awk 'BEGIN{RS=\"\";FS=\"\\n\"} /^dir: / { split(\$1,a,\":\"); gsub(/^dir:[[:space:]]*/,\"\",a[0]); store=a[0]; hasbackup=0; for(i=1;i<=NF;i++) if (\$i ~ /^[[:space:]]*content[[:space:]]+/ && \$i ~ /backup/){hasbackup=1} if(hasbackup){print store}}' /etc/pve/storage.cfg")
 
   # keep only active
   while read -r s; do
     [[ -z "$s" ]] && continue
-    if ssh -o BatchMode=yes "$SSH_USER@$host" "pvesm status | awk '{print \$1,\$2}' | grep -q '^${s} active\$'"; then
+    if ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$SSH_USER@$host" "pvesm status | awk '{print \$1,\$2}' | grep -q '^${s} active\$'"; then
       echo "$s"
     fi
   done <<< "$ids"
@@ -202,7 +208,7 @@ list_dir_backup_storages_remote() {
 free_gb_remote() {
   local host="$1" store="$2"
   local kb
-  kb=$(ssh -o BatchMode=yes "$SSH_USER@$host" "pvesm status | awk -v s='$store' '\$1==s {print \$4}'")
+  kb=$(ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$SSH_USER@$host" "pvesm status | awk -v s='$store' '\$1==s {print \$4}'")
   [[ -z "$kb" ]] && echo 0 && return
   echo $(( kb / 1024 / 1024 ))
 }
@@ -256,7 +262,10 @@ select_source_storage() {
 
 # ------------ SELECT TARGET STORAGE -----
 select_target_storage() {
+  
   local host="$1"
+  ensure_ssh_trust "$host"
+local host="$1"
   local eligible=() labels=() idx=1 choice sel store free path
   local last="${LAST_TARGET_STORE:-}"
 
