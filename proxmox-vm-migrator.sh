@@ -14,31 +14,109 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-VERSION="1.1.2"
+VERSION="1.1.3"
 GITHUB_REPO="dubsector/proxmox-vm-migrator"
 SCRIPT_NAME="proxmox-vm-migrator.sh"
 
 # ------------ CONFIGURATION ------------
 CONFIG_FILE="$HOME/.proxmox_vm_migrator.conf"
-# DUMP_PATH is determined dynamically from selected source storage (path + /dump)
-DUMP_PATH=""
-REMOTE_DUMP_PATH=""   # determined dynamically from selected target storage (path + /dump)
+DUMP_PATH="/var/lib/vz/dump"
+REMOTE_DUMP_PATH="/var/lib/vz/dump"
 SSH_USER="root"
 CLEANUP=false  # Set to true to delete local backup files after transfer
 LOGFILE="$HOME/proxmox_vm_migration_$(date +%F_%H-%M-%S).log"
 SHUTDOWN_TIMEOUT=60  # seconds
-MIN_FREE_GB=20       # Minimum GB required to proceed
 # ---------------------------------------
 
 # ------------ LOGGING SETUP ------------
 exec > >(tee -a "$LOGFILE") 2>&1
 
-# ------------ SSH TRUST PREFLIGHT ------------
+# ------------ CONFIG / SSH HELPERS (added) ------------
+# establish SSH trust (allow password on first run)
 ensure_ssh_trust() {
   local host="$1"
-  # Accept the host key if it's new; no prompt in non-interactive use.
-  ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$SSH_USER@$host" "true" 2>/dev/null
+  ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$host" "true" || true
 }
+
+# Simple sanitized config loader/saver
+cfg_load() {
+  [[ -f "$CONFIG_FILE" ]] || return
+  local _tmp
+  _tmp="$(mktemp)"
+  grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$CONFIG_FILE" > "$_tmp" || true
+  # shellcheck disable=SC1090
+  . "$_tmp"
+  rm -f "$_tmp"
+}
+cfg_set() {
+  local key="$1"; shift; local val="$*"
+  touch "$CONFIG_FILE"; chmod 600 "$CONFIG_FILE"
+  if grep -q "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
+    sed -i "s#^${key}=.*#${key}=${val}#g" "$CONFIG_FILE"
+  else
+    echo "${key}=${val}" >> "$CONFIG_FILE"
+  fi
+}
+cfg_load
+
+# Storage parsing from /etc/pve/storage.cfg (local) and remote
+get_dir_path_local() {
+  local store="$1"
+  awk -v s="$store" 'BEGIN{RS="";FS="\n"} $0 ~ "^dir: " s "([[:space:]]|$)" {for(i=1;i<=NF;i++) if($i ~ /^[[:space:]]*path[[:space:]]+/){split($i,a,/[[:space:]]+/); print a[2]; exit}}' /etc/pve/storage.cfg
+}
+get_dir_path_remote() {
+  local host="$1" store="$2"
+  ssh "$SSH_USER@$host" "awk -v s='$store' 'BEGIN{RS=\"\";FS=\"\\n\"} \$0 ~ \"^dir: \" s \"([[:space:]]|$)\" {for(i=1;i<=NF;i++) if(\$i ~ /^[[:space:]]*path[[:space:]]+/){split(\$i,a,/[^[:space:]]+[[:space:]]+/); print a[2]; exit}}' /etc/pve/storage.cfg"
+}
+list_dir_backup_local() {
+  awk 'BEGIN{RS="";FS="\n"} /^dir: /{split($1,a,\":\"); gsub(/^dir:[ \\t]*/,\"\",a[1]); id=a[1]; has=0; path=\"\"; for(i=1;i<=NF;i++){if($i ~ /^[ \\t]*content[ \\t]+/ && $i ~ /backup/) has=1; if($i ~ /^[ \\t]*path[ \\t]+/){split($i,b,/[ \\t]+/); path=b[2]}} if(has && path!=\"\"){print id\"|\"path}}' /etc/pve/storage.cfg
+}
+list_dir_backup_remote() {
+  local host="$1"
+  ssh "$SSH_USER@$host" "awk 'BEGIN{RS=\"\";FS=\"\\n\"} /^dir: /{split(\$1,a,\":\"); gsub(/^dir:[ \\t]*/,\"\",a[1]); id=a[1]; has=0; path=\"\"; for(i=1;i<=NF;i++){if(\$i ~ /^[ \\t]*content[ \\t]+/ && \$i ~ /backup/) has=1; if(\$i ~ /^[ \\t]*path[ \\t]+/){split(\$i,b,/[^[:space:]]+[[:space:]]+/); path=b[2]}} if(has && path!=\"\"){print id\"|\"path}}' /etc/pve/storage.cfg"
+}
+free_gb_local() { local store="$1"; local kb; kb=$(pvesm status | awk -v s="$store" '$1==s {print $4}'); [[ -z "$kb" ]] && echo 0 || echo $((kb/1024/1024)); }
+free_gb_remote() { local host="$1" store="$2"; local kb; kb=$(ssh "$SSH_USER@$host" "pvesm status | awk -v s='$store' '\$1==s {print \$4}'"); [[ -z "$kb" ]] && echo 0 || echo $((kb/1024/1024)); }
+
+select_source_storage() {
+  local last="${LAST_SOURCE_STORAGE:-}"; local ids=() paths=() frees=() labels=() i=1
+  while IFS='|' read -r id path; do
+    [[ -z "$id" || -z "$path" ]] && continue
+    pvesm status | awk '{print $1,$2}' | grep -q "^${id} active$" || continue
+    local free; free=$(free_gb_local "$id")
+    ids+=("$id"); paths+=("$path"); frees+=("$free"); labels+=("$i) $id — free: ${free} GB (path: $path)"); ((i++))
+  done < <(list_dir_backup_local)
+  (( ${#ids[@]} > 0 )) || { echo "❌ No eligible local directory storage with backup content."; exit 1; }
+  if [[ -n "$last" ]]; then
+    for j in "${!ids[@]}"; do
+      [[ "${ids[$j]}" == "$last" ]] && { echo "✅ Using last source: $last"; SELECTED_SOURCE_STORE="$last"; SELECTED_SOURCE_PATH="${paths[$j]}"; return; }
+    done
+  fi
+  echo "📂 Select SOURCE storage:"; printf '%s\n' "${labels[@]}"; read -p "Enter number [1-${#ids[@]}]: " choice
+  local idx=$((choice-1)); [[ $idx -ge 0 && $idx -lt ${#ids[@]} ]] || { echo "❌ Invalid selection."; exit 1; }
+  SELECTED_SOURCE_STORE="${ids[$idx]}"; SELECTED_SOURCE_PATH="${paths[$idx]}";
+}
+
+select_target_storage() {
+  local host="$1"; ensure_ssh_trust "$host"; local last="${LAST_TARGET_STORAGE:-}"; local ids=() paths=() frees=() labels=() i=1
+  while IFS='|' read -r id path; do
+    [[ -z "$id" || -z "$path" ]] && continue
+    ssh "$SSH_USER@$host" "pvesm status | awk '{print \\\$1,\\\$2}' | grep -q '^${id} active\$'" || continue
+    local free; free=$(free_gb_remote "$host" "$id")
+    ids+=("$id"); paths+=("$path"); frees+=("$free"); labels+=("$i) $id — free: ${free} GB (remote path: $path)"); ((i++))
+  done < <(list_dir_backup_remote "$host")
+  (( ${#ids[@]} > 0 )) || { echo "❌ No eligible TARGET directory storage with backup content on $host."; exit 1; }
+  if [[ -n "$last" ]]; then
+    for j in "${!ids[@]}"; do
+      [[ "${ids[$j]}" == "$last" ]] && { echo "✅ Using last target: $last"; SELECTED_TARGET_STORE="$last"; SELECTED_TARGET_PATH="${paths[$j]}"; return; }
+    done
+  fi
+  echo "📦 Select TARGET storage on $host:"; printf '%s\n' "${labels[@]}"; read -p "Enter number [1-${#ids[@]}]: " choice
+  local idx=$((choice-1)); [[ $idx -ge 0 && $idx -lt ${#ids[@]} ]] || { echo "❌ Invalid selection."; exit 1; }
+  SELECTED_TARGET_STORE="${ids[$idx]}"; SELECTED_TARGET_PATH="${paths[$idx]}";
+}
+
+
 # ------------ CHECK FOR UPDATES --------
 check_for_update() {
     echo "🔍 Checking for updates..."
@@ -79,40 +157,19 @@ check_for_update "$@"
 
 # ------------ TOOL CHECKS --------------
 echo "🔍 Performing pre-flight checks..."
-for cmd in vzdump rsync ssh qm pvesm awk sed grep; do
+for cmd in vzdump rsync ssh qm; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "❌ Required tool '$cmd' is not installed. Aborting."
         exit 1
     fi
 done
 
-# ------------ SIMPLE CONFIG KV ----------
-cfg_load() {
-  if [[ -f "$CONFIG_FILE" ]]; then
-    # shellcheck disable=SC1090
-    . "$CONFIG_FILE"
-  fi
-}
-
-cfg_set() {
-  local key="$1"; shift
-  local val="$*"
-  touch "$CONFIG_FILE"
-  chmod 600 "$CONFIG_FILE"
-  if grep -q "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
-    sed -i "s#^${key}=.*#${key}=${val}#g" "$CONFIG_FILE"
-  else
-    echo "${key}=${val}" >> "$CONFIG_FILE"
-  fi
-}
-
-cfg_load
 
 # ------------ TARGET HOST SETUP --------
 if [[ -n "$LAST_TARGET" ]]; then
-  echo "📁 Last target host: $LAST_TARGET"
+    echo "📁 Last target host: $LAST_TARGET"
 else
-  echo "📁 Last target host: (none)"
+    echo "📁 Last target host: (none)"
 fi
 
 read -p "🖥️ Enter target Proxmox host IP or hostname [${LAST_TARGET:-}]: " TARGET_HOST
@@ -124,193 +181,23 @@ if [ -z "$TARGET_HOST" ]; then
 fi
 cfg_set LAST_TARGET "$TARGET_HOST"
 
-# ------------ STORAGE HELPERS (LOCAL) ---
-# path of a dir storage on local node
-cfg_get_dir_path_local() {
-  local store="$1"
-  awk -v s="$store" '
-    BEGIN{RS=""; FS="\n"}
-    $0 ~ "^dir: " s "([[:space:]]|$)" {
-      for (i=1;i<=NF;i++) if ($i ~ /^[[:space:]]*path[[:space:]]+/) {
-        split($i,a,/[[:space:]]+/); print a[2]; exit
-      }
-    }' /etc/pve/storage.cfg
-}
+# Select storages (origin & target)
+select_source_storage
+select_target_storage "$TARGET_HOST"
+SOURCE_PATH="$SELECTED_SOURCE_PATH"
+TARGET_PATH="$SELECTED_TARGET_PATH"
+DUMP_PATH="${SOURCE_PATH}/dump"
+REMOTE_DUMP_PATH="${TARGET_PATH}/dump"
+cfg_set LAST_SOURCE_STORAGE "$SELECTED_SOURCE_STORE"
+cfg_set LAST_TARGET_STORAGE "$SELECTED_TARGET_STORE"
+ssh "$SSH_USER@$TARGET_HOST" "mkdir -p '$REMOTE_DUMP_PATH'" || { echo "❌ Failed to ensure remote directory exists: $REMOTE_DUMP_PATH"; exit 1; }
 
-# does a local storage declare content=...backup... ?
-cfg_storage_has_backup_local() {
-  local store="$1"
-  awk -v s="$store" '
-    BEGIN{RS=""; FS="\n"}
-    $0 ~ "^dir: " s "([[:space:]]|$)" {
-      for (i=1;i<=NF;i++) if ($i ~ /^[[:space:]]*content[[:space:]]+/) {
-        if ($i ~ /backup/) { print "yes"; exit }
-      }
-    }' /etc/pve/storage.cfg
-}
-
-# list eligible local dir storages that support backup and are active
-list_dir_backup_storages_local() {
-  local ids
-  ids=$(awk '
-    BEGIN{RS=""; FS="\n"}
-    /^dir: / { split($1,a,":"); gsub(/^dir:[[:space:]]*/,"",a[0]); store=a[0];
-      hasbackup=0; for (i=1;i<=NF;i++) if ($i ~ /^[[:space:]]*content[[:space:]]+/ && $i ~ /backup/){hasbackup=1}
-      if(hasbackup){print store}
-    }' /etc/pve/storage.cfg)
-
-  # keep only active storages
-  while read -r s; do
-    [[ -z "$s" ]] && continue
-    if pvesm status | awk '{print $1,$2}' | grep -q "^${s} active$"; then
-      echo "$s"
-    fi
-  done <<< "$ids"
-}
-
-# free GB for local storage from pvesm status (avail in KiB -> GB)
-free_gb_local() {
-  local store="$1"
-  local kb
-  kb=$(pvesm status | awk -v s="$store" '$1==s {print $4}')
-  [[ -z "$kb" ]] && echo 0 && return
-  echo $(( kb / 1024 / 1024 ))
-}
-
-# ------------ STORAGE HELPERS (REMOTE) --
-cfg_get_dir_path_remote() {
-  local host="$1" store="$2"
-  ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$SSH_USER@$host" \
-    "awk -v s='$store' 'BEGIN{RS=\"\";FS=\"\\n\"} \$0 ~ \"^dir: \" s \"([[:space:]]|$)\" { for(i=1;i<=NF;i++) if (\$i ~ /^[[:space:]]*path[[:space:]]+/){ split(\$i,a,/[^[:space:]]+[[:space:]]+/); print a[2]; exit } }' /etc/pve/storage.cfg"
-}
-
-cfg_storage_has_backup_remote() {
-  local host="$1" store="$2"
-  ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$SSH_USER@$host" \
-    "awk -v s='$store' 'BEGIN{RS=\"\";FS=\"\\n\"} \$0 ~ \"^dir: \" s \"([[:space:]]|$)\" { for(i=1;i<=NF;i++) if (\$i ~ /^[[:space:]]*content[[:space:]]+/ && \$i ~ /backup/){ print \"yes\"; exit } }' /etc/pve/storage.cfg"
-}
-
-list_dir_backup_storages_remote() {
-  local host="$1"
-  local ids
-  ids=$(ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$SSH_USER@$host" \
-    "awk 'BEGIN{RS=\"\";FS=\"\\n\"} /^dir: / { split(\$1,a,\":\"); gsub(/^dir:[[:space:]]*/,\"\",a[0]); store=a[0]; hasbackup=0; for(i=1;i<=NF;i++) if (\$i ~ /^[[:space:]]*content[[:space:]]+/ && \$i ~ /backup/){hasbackup=1} if(hasbackup){print store}}' /etc/pve/storage.cfg")
-
-  # keep only active
-  while read -r s; do
-    [[ -z "$s" ]] && continue
-    if ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$SSH_USER@$host" "pvesm status | awk '{print \$1,\$2}' | grep -q '^${s} active\$'"; then
-      echo "$s"
-    fi
-  done <<< "$ids"
-}
-
-free_gb_remote() {
-  local host="$1" store="$2"
-  local kb
-  kb=$(ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$SSH_USER@$host" "pvesm status | awk -v s='$store' '\$1==s {print \$4}'")
-  [[ -z "$kb" ]] && echo 0 && return
-  echo $(( kb / 1024 / 1024 ))
-}
-
-# ------------ SELECT SOURCE STORAGE -----
-select_source_storage() {
-  local eligible=() labels=() idx=1 choice sel store free path
-  local last="${LAST_SOURCE_STORE:-}"
-
-  while read -r s; do
-    [[ -z "$s" ]] && continue
-    # ensure backup content + path exists
-    [[ -z "$(cfg_storage_has_backup_local "$s")" ]] && continue
-    path="$(cfg_get_dir_path_local "$s")"
-    [[ -z "$path" ]] && continue
-    free="$(free_gb_local "$s")"
-    if (( free >= MIN_FREE_GB )); then
-      eligible+=("$s")
-      labels+=("$idx) $s  —  free: ${free} GB  (path: $path)")
-      ((idx++))
-    fi
-  done < <(list_dir_backup_storages_local)
-
-  if ((${#eligible[@]}==0)); then
-    echo "❌ No eligible local directory storage with ≥ ${MIN_FREE_GB} GB free. Aborting."
-    exit 1
-  fi
-
-  # auto-select last if still eligible
-  if [[ -n "$last" ]]; then
-    for s in "${eligible[@]}"; do
-      if [[ "$s" == "$last" ]]; then
-        echo "✅ Using last source storage: $s"
-        echo "$s"
-        return 0
-      fi
-    done
-  fi
-
-  echo "📂 Select SOURCE storage for backups:"
-  printf '%s\n' "${labels[@]}"
-  read -p "Enter number [1-${#eligible[@]}]: " choice
-  sel=$((choice-1))
-  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#eligible[@]} )); then
-    echo "❌ Invalid selection."
-    exit 1
-  fi
-  store="${eligible[$sel]}"
-  echo "$store"
-}
-
-# ------------ SELECT TARGET STORAGE -----
-select_target_storage() {
-  
-  local host="$1"
-  ensure_ssh_trust "$host"
-local host="$1"
-  local eligible=() labels=() idx=1 choice sel store free path
-  local last="${LAST_TARGET_STORE:-}"
-
-  while read -r s; do
-    [[ -z "$s" ]] && continue
-    [[ -z "$(cfg_storage_has_backup_remote "$host" "$s")" ]] && continue
-    path="$(cfg_get_dir_path_remote "$host" "$s")"
-    [[ -z "$path" ]] && continue
-    free="$(free_gb_remote "$host" "$s")"
-    if (( free >= MIN_FREE_GB )); then
-      eligible+=("$s")
-      labels+=("$idx) $s  —  free: ${free} GB  (remote path: $path)")
-      ((idx++))
-    fi
-  done < <(list_dir_backup_storages_remote "$host")
-
-  if ((${#eligible[@]}==0)); then
-    echo "❌ No eligible TARGET directory storage with ≥ ${MIN_FREE_GB} GB free on $host. Aborting."
-    exit 1
-  fi
-
-  # auto-select last if still eligible
-  if [[ -n "$last" ]]; then
-    for s in "${eligible[@]}"; do
-      if [[ "$s" == "$last" ]]; then
-        echo "✅ Using last target storage: $s"
-        echo "$s"
-        return 0
-      fi
-    done
-  fi
-
-  echo "📦 Select TARGET storage to receive backups on $host:"
-  printf '%s\n' "${labels[@]}"
-  read -p "Enter number [1-${#eligible[@]}]: " choice
-  sel=$((choice-1))
-  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#eligible[@]} )); then
-    echo "❌ Invalid selection."
-    exit 1
-  fi
-  store="${eligible[$sel]}"
-  echo "$store"
-}
+echo "🔎 Validating free space ≥ ${MIN_FREE_GB} GB..."
+echo "   • Source: ${SELECTED_SOURCE_STORE} — free $(free_gb_local "${SELECTED_SOURCE_STORE}") GB (path: $SOURCE_PATH)"
+echo "   • Target: ${SELECTED_TARGET_STORE} — free $(free_gb_remote "$TARGET_HOST" "${SELECTED_TARGET_STORE}") GB (path: $TARGET_PATH)"
 
 # ------------ VM INPUT -----------------
+
 echo ""
 echo "💡 Enter VMIDs to migrate using spaces."
 echo "   - Use single IDs:  101 110"
@@ -350,42 +237,26 @@ if [ ${#VM_IDS[@]} -eq 0 ]; then
     exit 1
 fi
 
-# ------------ SELECT STORAGES ----------
-SOURCE_STORE="$(select_source_storage)"
-SOURCE_PATH="$(cfg_get_dir_path_local "$SOURCE_STORE")"
-DUMP_PATH="$SOURCE_PATH/dump"
-
-TARGET_STORE="$(select_target_storage "$TARGET_HOST")"
-TARGET_PATH="$(cfg_get_dir_path_remote "$TARGET_HOST" "$TARGET_STORE")"
-REMOTE_DUMP_PATH="$TARGET_PATH/dump"
-
-echo "🔎 Validating free space ≥ ${MIN_FREE_GB} GB..."
-SRC_FREE="$(free_gb_local "$SOURCE_STORE")"
-DST_FREE="$(free_gb_remote "$TARGET_HOST" "$TARGET_STORE")"
-echo "   • Source: $SOURCE_STORE  — free ${SRC_FREE} GB (path: $SOURCE_PATH)"
-echo "   • Target: $TARGET_STORE  — free ${DST_FREE} GB (path: $TARGET_PATH)"
-
-# persist last choices
-cfg_set LAST_SOURCE_STORE "$SOURCE_STORE"
-cfg_set LAST_TARGET_STORE "$TARGET_STORE"
-
-# ensure remote dump dir exists
-ssh "$SSH_USER@$TARGET_HOST" "mkdir -p '$REMOTE_DUMP_PATH'" || {
-    echo "❌ Failed to ensure remote directory exists: $REMOTE_DUMP_PATH"
-    exit 1
-}
-
 # ------------ CONFIRM ------------------
 echo ""
 echo "✅ Target Host: $TARGET_HOST"
 echo "✅ VMIDs to migrate: ${VM_IDS[*]}"
-echo "✅ Source backup storage: $SOURCE_STORE  ($SOURCE_PATH)"
-echo "✅ Target backup storage: $TARGET_STORE  ($TARGET_PATH)"
+echo "✅ Source backup storage: ${SELECTED_SOURCE_STORE}  ($SOURCE_PATH)"
+echo "✅ Target backup storage: ${SELECTED_TARGET_STORE}  ($TARGET_PATH)"
+echo ""
+echo "✅ VMIDs to migrate: ${VM_IDS[*]}"
 read -p "⚠️  Proceed with backup and transfer? [y/N]: " CONFIRM
 if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     echo "🛑 Aborted by user."
     exit 0
 fi
+
+# ------------ REMOTE DIR CHECK ---------
+echo "📦 Checking for remote dump directory on $TARGET_HOST..."
+ssh "$SSH_USER@$TARGET_HOST" "test -d '$REMOTE_DUMP_PATH' || mkdir -p '$REMOTE_DUMP_PATH'" || {
+    echo "❌ Failed to ensure remote directory exists."
+    exit 1
+}
 
 # ------------ MIGRATION PROCESS --------
 TOTAL_START=$(date +%s)
@@ -423,23 +294,19 @@ for VMID in "${VM_IDS[@]}"; do
         echo "✅ VM $VMID is already stopped."
     fi
 
-    echo "💾 Backing up VM $VMID to storage '$SOURCE_STORE'..."
-    # Use storage ID so vzdump uses storage's dump dir automatically
-    if ! vzdump "$VMID" --compress zstd --storage "$SOURCE_STORE"; then
-        echo "❌ vzdump failed for VM $VMID."
-        FAILED_IDS+=("$VMID")
-        continue
-    fi
-
+    echo "💾 Backing up VM $VMID..."
+    vzdump $VMID --compress zstd --storage "$SELECTED_SOURCE_STORE"
     BACKUP_FILE=$(ls -t "$DUMP_PATH"/vzdump-qemu-${VMID}-*.zst 2>/dev/null | head -n 1)
+
     if [ ! -f "$BACKUP_FILE" ]; then
-        echo "❌ Backup for VM $VMID not found in $DUMP_PATH. Skipping."
+        echo "❌ Backup for VM $VMID not found. Skipping."
         FAILED_IDS+=("$VMID")
         continue
     fi
 
-    echo "📤 Transferring $(basename "$BACKUP_FILE") to $TARGET_HOST:$REMOTE_DUMP_PATH with progress..."
-    if ! rsync -ah --progress "$BACKUP_FILE" "$SSH_USER@$TARGET_HOST:$REMOTE_DUMP_PATH/"; then
+    echo "📤 Transferring $BACKUP_FILE to $TARGET_HOST with progress..."
+    rsync -ah --progress "$BACKUP_FILE" "$SSH_USER@$TARGET_HOST:$REMOTE_DUMP_PATH/"
+    if [ $? -ne 0 ]; then
         echo "❌ Transfer failed for VM $VMID."
         FAILED_IDS+=("$VMID")
         continue
